@@ -1,4 +1,5 @@
 import Fastify from "fastify";
+import jwt from "@fastify/jwt";
 import { z } from "zod";
 
 type LocationRecord = {
@@ -11,6 +12,12 @@ type LocationRecord = {
 };
 
 const app = Fastify({ logger: true });
+
+// --- Config ---
+const JWT_SECRET = process.env.JWT_SECRET ?? "dev-secret-change-me";
+
+// --- Plugins ---
+await app.register(jwt, { secret: JWT_SECRET });
 
 // -------- Settings --------
 const STALE_AFTER_MS = 60_000;  // delete if no update for 1 minute
@@ -114,6 +121,16 @@ setInterval(cleanupStale, CLEANUP_EVERY_MS).unref();
 
 // -------- Routes --------
 app.get("/health", async () => ({ ok: true }));
+
+// Require auth for all routes except /health
+app.addHook("onRequest", async (req, reply) => {
+  if (req.url === "/health") return;
+  try {
+    await req.jwtVerify();
+  } catch {
+    return reply.code(401).send({ message: "Unauthorized" });
+  }
+});
 
 /**
  * POST /v1/locations

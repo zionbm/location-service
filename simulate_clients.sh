@@ -1,15 +1,16 @@
 #!/bin/bash
 
 URL="http://localhost:3000/v1/locations"
+AUTH_URL="http://localhost:4000/v1/auth"
 INTERVAL=3
-CLIENT_COUNT=10
+CLIENT_COUNT=5
 
 BASE_LAT=31.771959
 BASE_LON=35.217018
 
 STEP=0.00005
 
-declare -a IDS LATS LONS DIR_LAT DIR_LON
+declare -a IDS LATS LONS DIR_LAT DIR_LON TOKENS
 
 # Init clients
 for i in $(seq 1 $CLIENT_COUNT); do
@@ -18,6 +19,38 @@ for i in $(seq 1 $CLIENT_COUNT); do
   LONS[$i]=$(echo "$BASE_LON + ($i * 0.00002)" | bc -l)
   DIR_LAT[$i]=$((RANDOM % 2 == 0 ? 1 : -1))
   DIR_LON[$i]=$((RANDOM % 2 == 0 ? 1 : -1))
+done
+
+# Register + login to get tokens
+for i in $(seq 1 $CLIENT_COUNT); do
+  EMAIL="${IDS[$i]}@example.com"
+  PASSWORD="Pass1234!"
+
+  REGISTER_PAYLOAD=$(jq -n \
+    --arg email "$EMAIL" \
+    --arg password "$PASSWORD" \
+    '{email:$email, password:$password}')
+
+  # Register (ignore if already exists)
+  curl -s -X POST "$AUTH_URL/register" \
+    -H "Content-Type: application/json" \
+    -d "$REGISTER_PAYLOAD" >/dev/null
+
+  LOGIN_PAYLOAD=$(jq -n \
+    --arg email "$EMAIL" \
+    --arg password "$PASSWORD" \
+    '{email:$email, password:$password}')
+
+  LOGIN_RESPONSE=$(curl -s -X POST "$AUTH_URL/login" \
+    -H "Content-Type: application/json" \
+    -d "$LOGIN_PAYLOAD")
+
+  TOKEN=$(echo "$LOGIN_RESPONSE" | jq -r '.token // empty')
+  if [[ -z "$TOKEN" ]]; then
+    echo "Failed to login for ${EMAIL}: $LOGIN_RESPONSE"
+    exit 1
+  fi
+  TOKENS[$i]="$TOKEN"
 done
 
 echo
@@ -38,15 +71,23 @@ while true; do
       --argjson lon "${LONS[$i]}" \
       '{id:$id, lat:$lat, lon:$lon}')
 
+    AUTH_HEADER="Authorization: Bearer ${TOKENS[$i]}"
     RESPONSE=$(curl -s -X POST "$URL" \
       -H "Content-Type: application/json" \
+      -H "$AUTH_HEADER" \
       -d "$REQUEST")
 
     echo
     echo "{"
     echo "  \"client\": \"${IDS[$i]}\","
-    echo "  \"request\":"
+    echo "  \"request\": {"
+    echo "    \"headers\": {"
+    echo "      \"Content-Type\": \"application/json\","
+    echo "      \"Authorization\": \"Bearer ${TOKENS[$i]}\""
+    echo "    },"
+    echo "    \"body\":"
     echo "$REQUEST" | jq
+    echo "  },"
     echo "  ,\"response\":"
     echo "$RESPONSE" | jq
     echo "}"
