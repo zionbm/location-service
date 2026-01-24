@@ -25,11 +25,13 @@ done
 for i in $(seq 1 $CLIENT_COUNT); do
   EMAIL="${IDS[$i]}@example.com"
   PASSWORD="Pass1234!"
+  DOG_NAME="Dog-${i}"
 
   REGISTER_PAYLOAD=$(jq -n \
     --arg email "$EMAIL" \
     --arg password "$PASSWORD" \
-    '{email:$email, password:$password}')
+    --arg dogName "$DOG_NAME" \
+    '{email:$email, password:$password, dogName:$dogName}')
 
   # Register (ignore if already exists)
   curl -s -X POST "$AUTH_URL/register" \
