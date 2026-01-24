@@ -20,7 +20,7 @@ const JWT_SECRET = process.env.JWT_SECRET ?? "dev-secret-change-me";
 await app.register(jwt, { secret: JWT_SECRET });
 
 // -------- Settings --------
-const STALE_AFTER_MS = 60_000;  // delete if no update for 1 minute
+const STALE_AFTER_MS = Number(process.env.STALE_AFTER_MS ?? 30_000); // default 30s
 const CLEANUP_EVERY_MS = 5_000; // run cleanup every 5s
 const NEARBY_RADIUS_M = 500;    // search radius
 
