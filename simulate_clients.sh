@@ -5,8 +5,9 @@ AUTH_URL="http://localhost:4000/v1/auth"
 INTERVAL=3
 CLIENT_COUNT=5
 
-BASE_LAT=31.7722
-BASE_LON=35.2173
+# iOS simulator default (Tel Aviv)
+BASE_LAT=32.0853
+BASE_LON=34.7818
 
 STEP=0.00005
 
@@ -48,11 +49,13 @@ for i in $(seq 1 $CLIENT_COUNT); do
     -d "$LOGIN_PAYLOAD")
 
   TOKEN=$(echo "$LOGIN_RESPONSE" | jq -r '.token // empty')
-  if [[ -z "$TOKEN" ]]; then
+  PUBLIC_ID=$(echo "$LOGIN_RESPONSE" | jq -r '.publicId // empty')
+  if [[ -z "$TOKEN" || -z "$PUBLIC_ID" ]]; then
     echo "Failed to login for ${EMAIL}: $LOGIN_RESPONSE"
     exit 1
   fi
   TOKENS[$i]="$TOKEN"
+  IDS[$i]="$PUBLIC_ID"
 done
 
 echo
@@ -90,7 +93,7 @@ while true; do
     echo "    \"body\":"
     echo "$REQUEST" | jq
     echo "  },"
-    echo "  ,\"response\":"
+    echo "  \"response\":"
     echo "$RESPONSE" | jq
     echo "}"
   done
