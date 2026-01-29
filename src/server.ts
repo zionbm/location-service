@@ -1,6 +1,8 @@
 import Fastify from "fastify";
 import jwt from "@fastify/jwt";
+import rateLimit from "@fastify/rate-limit";
 import { z } from "zod";
+import Redis from "ioredis";
 
 type LocationRecord = {
   id: string;
@@ -15,11 +17,19 @@ type LocationRecord = {
 const app = Fastify({ logger: true });
 
 // --- Config ---
-const JWT_SECRET = process.env.JWT_SECRET ?? "dev-secret-change-me";
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+  throw new Error("JWT_SECRET is required");
+}
 const SOCIAL_SERVICE_URL = process.env.SOCIAL_SERVICE_URL ?? "http://localhost:5001";
+const REDIS_URL = process.env.REDIS_URL;
 
 // --- Plugins ---
 await app.register(jwt, { secret: JWT_SECRET });
+await app.register(rateLimit, {
+  max: 120,
+  timeWindow: "1 minute"
+});
 
 // -------- Settings --------
 const STALE_AFTER_MS = Number(process.env.STALE_AFTER_MS ?? 30_000); // default 30s
@@ -32,6 +42,11 @@ const CELL_SIZE_M = 250;
 // -------- Storage --------
 const store = new Map<string, LocationRecord>();       // id -> record
 const grid = new Map<string, Set<string>>();           // "x:y" -> set of ids
+
+const redis = REDIS_URL ? new Redis(REDIS_URL) : null;
+const REDIS_GEO_KEY = "loc:geo";
+const REDIS_LAST_KEY = "loc:last";
+const REDIS_DATA_PREFIX = "loc:data:";
 
 // -------- Validation --------
 const LocationUpdateSchema = z.object({
@@ -132,6 +147,25 @@ async function getFriendInfo(req: any): Promise<FriendInfo | null> {
   return data;
 }
 
+async function getRecordById(id: string): Promise<LocationRecord | null> {
+  if (!redis) {
+    return store.get(id) ?? null;
+  }
+  const data = await redis.hgetall(`${REDIS_DATA_PREFIX}${id}`);
+  if (!data || Object.keys(data).length === 0) return null;
+  const rec: LocationRecord = {
+    id,
+    lat: Number(data.lat),
+    lon: Number(data.lon),
+    receivedAtMs: Number(data.receivedAtMs),
+    cellX: 0,
+    cellY: 0,
+    visibility: (data.visibility as "public" | "friends") ?? "public"
+  };
+  if (!Number.isFinite(rec.lat) || !Number.isFinite(rec.lon)) return null;
+  return rec;
+}
+
 /** Remove stale users (from store + grid) */
 function cleanupStale(): void {
   const now = Date.now();
@@ -143,6 +177,66 @@ function cleanupStale(): void {
 }
 
 setInterval(cleanupStale, CLEANUP_EVERY_MS).unref();
+
+async function redisCleanupStale(): Promise<void> {
+  if (!redis) return;
+  const cutoff = Date.now() - STALE_AFTER_MS;
+  const staleIds = await redis.zrangebyscore(REDIS_LAST_KEY, "-inf", String(cutoff));
+  if (staleIds.length === 0) return;
+  const pipeline = redis.pipeline();
+  for (const id of staleIds) {
+    pipeline.zrem(REDIS_LAST_KEY, id);
+    pipeline.zrem(REDIS_GEO_KEY, id);
+    pipeline.del(`${REDIS_DATA_PREFIX}${id}`);
+  }
+  await pipeline.exec();
+}
+
+async function storeLocationRedis(rec: LocationRecord): Promise<void> {
+  if (!redis) return;
+  await redisCleanupStale();
+  const key = `${REDIS_DATA_PREFIX}${rec.id}`;
+  const pipeline = redis.pipeline();
+  pipeline.geoadd(REDIS_GEO_KEY, rec.lon, rec.lat, rec.id);
+  pipeline.hset(key, {
+    lat: String(rec.lat),
+    lon: String(rec.lon),
+    visibility: rec.visibility,
+    receivedAtMs: String(rec.receivedAtMs)
+  });
+  pipeline.zadd(REDIS_LAST_KEY, rec.receivedAtMs, rec.id);
+  pipeline.expire(key, Math.ceil(STALE_AFTER_MS / 1000));
+  await pipeline.exec();
+}
+
+async function getNearbyRedis(lat: number, lon: number): Promise<LocationRecord[]> {
+  if (!redis) return [];
+  await redisCleanupStale();
+  const ids = await redis.geosearch(REDIS_GEO_KEY, "FROMLONLAT", lon, lat, "BYRADIUS", NEARBY_RADIUS_M, "m");
+  if (ids.length === 0) return [];
+  const pipeline = redis.pipeline();
+  for (const id of ids) {
+    pipeline.hgetall(`${REDIS_DATA_PREFIX}${id}`);
+  }
+  const results = await pipeline.exec();
+  const records: LocationRecord[] = [];
+  results.forEach((res, i) => {
+    const data = res?.[1] as Record<string, string> | undefined;
+    if (!data) return;
+    const rec: LocationRecord = {
+      id: ids[i],
+      lat: Number(data.lat),
+      lon: Number(data.lon),
+      receivedAtMs: Number(data.receivedAtMs),
+      cellX: 0,
+      cellY: 0,
+      visibility: (data.visibility as "public" | "friends") ?? "public"
+    };
+    if (!Number.isFinite(rec.lat) || !Number.isFinite(rec.lon)) return;
+    records.push(rec);
+  });
+  return records;
+}
 
 // -------- Routes --------
 app.get("/health", async () => ({ ok: true }));
@@ -180,24 +274,37 @@ app.post("/v1/locations", async (req, reply) => {
   }
   const id = friendInfo.publicId;
 
-  // Compute new cell
+  // Compute new cell (for in-memory store)
   const { x: newCellX, y: newCellY } = latLonToCell(lat, lon);
 
   // Update store + grid (move between cells if needed)
-  const prev = store.get(id);
-  if (prev) {
-    if (prev.cellX !== newCellX || prev.cellY !== newCellY) {
-      removeFromGrid(id, prev.cellX, prev.cellY);
+  if (!redis) {
+    const prev = store.get(id);
+    if (prev) {
+      if (prev.cellX !== newCellX || prev.cellY !== newCellY) {
+        removeFromGrid(id, prev.cellX, prev.cellY);
+        addToGrid(id, newCellX, newCellY);
+      }
+      prev.lat = lat;
+      prev.lon = lon;
+      prev.receivedAtMs = nowMs;
+      prev.cellX = newCellX;
+      prev.cellY = newCellY;
+      prev.visibility = visibility;
+    } else {
+      store.set(id, {
+        id,
+        lat,
+        lon,
+        receivedAtMs: nowMs,
+        cellX: newCellX,
+        cellY: newCellY,
+        visibility
+      });
       addToGrid(id, newCellX, newCellY);
     }
-    prev.lat = lat;
-    prev.lon = lon;
-    prev.receivedAtMs = nowMs;
-    prev.cellX = newCellX;
-    prev.cellY = newCellY;
-    prev.visibility = visibility;
   } else {
-    store.set(id, {
+    await storeLocationRedis({
       id,
       lat,
       lon,
@@ -206,7 +313,6 @@ app.post("/v1/locations", async (req, reply) => {
       cellY: newCellY,
       visibility
     });
-    addToGrid(id, newCellX, newCellY);
   }
 
   // Find nearby candidates by checking neighboring cells only
@@ -215,37 +321,54 @@ app.post("/v1/locations", async (req, reply) => {
 
   const friendsSet = new Set(friendInfo.friends ?? []);
 
-  for (let dx = -cellRange; dx <= cellRange; dx++) {
-    for (let dy = -cellRange; dy <= cellRange; dy++) {
-      const key = cellKey(newCellX + dx, newCellY + dy);
-      const idsInCell = grid.get(key);
-      if (!idsInCell) continue;
+  if (!redis) {
+    for (let dx = -cellRange; dx <= cellRange; dx++) {
+      for (let dy = -cellRange; dy <= cellRange; dy++) {
+        const key = cellKey(newCellX + dx, newCellY + dy);
+        const idsInCell = grid.get(key);
+        if (!idsInCell) continue;
 
-      for (const otherId of idsInCell) {
-        if (otherId === id) continue;
+        for (const otherId of idsInCell) {
+          if (otherId === id) continue;
 
-        const other = store.get(otherId);
-        if (!other) continue;
+          const other = store.get(otherId);
+          if (!other) continue;
 
-        // Ignore stale (in case cleanup hasn't run yet)
-        if (nowMs - other.receivedAtMs > STALE_AFTER_MS) {
-          deleteUser(otherId);
-          continue;
-        }
+          // Ignore stale (in case cleanup hasn't run yet)
+          if (nowMs - other.receivedAtMs > STALE_AFTER_MS) {
+            deleteUser(otherId);
+            continue;
+          }
 
-        // Exact distance filter
-        const d = distanceMeters(lat, lon, other.lat, other.lon);
-        if (d <= NEARBY_RADIUS_M) {
-          const isFriend = friendsSet.has(other.id);
-          if (visibility === "friends") {
-            if (isFriend) {
-              nearByClients.push({ id: other.id, lat: other.lat, lon: other.lon });
-            }
-          } else {
-            if (other.visibility === "public" || isFriend) {
-              nearByClients.push({ id: other.id, lat: other.lat, lon: other.lon });
+          // Exact distance filter
+          const d = distanceMeters(lat, lon, other.lat, other.lon);
+          if (d <= NEARBY_RADIUS_M) {
+            const isFriend = friendsSet.has(other.id);
+            if (visibility === "friends") {
+              if (isFriend) {
+                nearByClients.push({ id: other.id, lat: other.lat, lon: other.lon });
+              }
+            } else {
+              if (other.visibility === "public" || isFriend) {
+                nearByClients.push({ id: other.id, lat: other.lat, lon: other.lon });
+              }
             }
           }
+        }
+      }
+    }
+  } else {
+    const nearby = await getNearbyRedis(lat, lon);
+    for (const other of nearby) {
+      if (other.id === id) continue;
+      const isFriend = friendsSet.has(other.id);
+      if (visibility === "friends") {
+        if (isFriend) {
+          nearByClients.push({ id: other.id, lat: other.lat, lon: other.lon });
+        }
+      } else {
+        if (other.visibility === "public" || isFriend) {
+          nearByClients.push({ id: other.id, lat: other.lat, lon: other.lon });
         }
       }
     }
@@ -260,11 +383,11 @@ app.post("/v1/locations", async (req, reply) => {
 // Optional debug endpoints
 app.get("/v1/locations/:id", async (req, reply) => {
   const id = (req.params as { id: string }).id;
-  const rec = store.get(id);
+  const rec = await getRecordById(id);
   if (!rec) return reply.code(404).send({ message: "Not found" });
 
   if (Date.now() - rec.receivedAtMs > STALE_AFTER_MS) {
-    deleteUser(id);
+    if (!redis) deleteUser(id);
     return reply.code(404).send({ message: "Not found" });
   }
 
@@ -272,8 +395,11 @@ app.get("/v1/locations/:id", async (req, reply) => {
 });
 
 app.get("/v1/locations", async () => {
-  cleanupStale();
-  return { count: store.size, gridCells: grid.size };
+  if (!redis) {
+    cleanupStale();
+    return { count: store.size, gridCells: grid.size };
+  }
+  return { count: -1, gridCells: -1 };
 });
 
 const port = Number(process.env.PORT ?? 3000);
