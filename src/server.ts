@@ -9,12 +9,14 @@ type LocationRecord = {
   receivedAtMs: number;
   cellX: number;
   cellY: number;
+  visibility: "public" | "friends";
 };
 
 const app = Fastify({ logger: true });
 
 // --- Config ---
 const JWT_SECRET = process.env.JWT_SECRET ?? "dev-secret-change-me";
+const SOCIAL_SERVICE_URL = process.env.SOCIAL_SERVICE_URL ?? "http://localhost:5001";
 
 // --- Plugins ---
 await app.register(jwt, { secret: JWT_SECRET });
@@ -33,9 +35,9 @@ const grid = new Map<string, Set<string>>();           // "x:y" -> set of ids
 
 // -------- Validation --------
 const LocationUpdateSchema = z.object({
-  id: z.string().min(1).max(200),
   lat: z.number().min(-90).max(90),
   lon: z.number().min(-180).max(180),
+  visibility: z.enum(["public", "friends"]).optional(),
 });
 
 // -------- Helpers --------
@@ -107,6 +109,29 @@ function deleteUser(id: string): void {
   store.delete(id);
 }
 
+type FriendInfo = { publicId: string; friends: string[] };
+const friendCache = new Map<string, { data: FriendInfo; expiresAt: number }>();
+
+async function getFriendInfo(req: any): Promise<FriendInfo | null> {
+  const email = req.user?.sub;
+  if (!email || typeof email !== "string") return null;
+  const cached = friendCache.get(email);
+  const now = Date.now();
+  if (cached && cached.expiresAt > now) return cached.data;
+
+  const auth = req.headers["authorization"];
+  if (!auth || typeof auth !== "string") return null;
+
+  const res = await fetch(`${SOCIAL_SERVICE_URL}/v1/me/friends`, {
+    headers: { Authorization: auth }
+  });
+  if (!res.ok) return null;
+  const data = (await res.json()) as FriendInfo;
+  if (!data?.publicId) return null;
+  friendCache.set(email, { data, expiresAt: now + 15_000 });
+  return data;
+}
+
 /** Remove stale users (from store + grid) */
 function cleanupStale(): void {
   const now = Date.now();
@@ -146,8 +171,14 @@ app.post("/v1/locations", async (req, reply) => {
     });
   }
 
-  const { id, lat, lon } = parsed.data;
+  const { lat, lon } = parsed.data;
+  const visibility = parsed.data.visibility ?? "public";
   const nowMs = Date.now();
+  const friendInfo = await getFriendInfo(req);
+  if (!friendInfo) {
+    return reply.code(401).send({ message: "Unauthorized" });
+  }
+  const id = friendInfo.publicId;
 
   // Compute new cell
   const { x: newCellX, y: newCellY } = latLonToCell(lat, lon);
@@ -164,14 +195,25 @@ app.post("/v1/locations", async (req, reply) => {
     prev.receivedAtMs = nowMs;
     prev.cellX = newCellX;
     prev.cellY = newCellY;
+    prev.visibility = visibility;
   } else {
-    store.set(id, { id, lat, lon, receivedAtMs: nowMs, cellX: newCellX, cellY: newCellY });
+    store.set(id, {
+      id,
+      lat,
+      lon,
+      receivedAtMs: nowMs,
+      cellX: newCellX,
+      cellY: newCellY,
+      visibility
+    });
     addToGrid(id, newCellX, newCellY);
   }
 
   // Find nearby candidates by checking neighboring cells only
   const cellRange = Math.ceil(NEARBY_RADIUS_M / CELL_SIZE_M); // e.g. 500/250 => 2
   const nearByClients: Array<{ id: string; lat: number; lon: number }> = [];
+
+  const friendsSet = new Set(friendInfo.friends ?? []);
 
   for (let dx = -cellRange; dx <= cellRange; dx++) {
     for (let dy = -cellRange; dy <= cellRange; dy++) {
@@ -194,7 +236,16 @@ app.post("/v1/locations", async (req, reply) => {
         // Exact distance filter
         const d = distanceMeters(lat, lon, other.lat, other.lon);
         if (d <= NEARBY_RADIUS_M) {
-          nearByClients.push({ id: other.id, lat: other.lat, lon: other.lon });
+          const isFriend = friendsSet.has(other.id);
+          if (visibility === "friends") {
+            if (isFriend) {
+              nearByClients.push({ id: other.id, lat: other.lat, lon: other.lon });
+            }
+          } else {
+            if (other.visibility === "public" || isFriend) {
+              nearByClients.push({ id: other.id, lat: other.lat, lon: other.lon });
+            }
+          }
         }
       }
     }

@@ -71,10 +71,10 @@ while true; do
     LONS[$i]=$(echo "${LONS[$i]} + (${DIR_LON[$i]} * $STEP)" | bc -l)
 
     REQUEST=$(jq -n \
-      --arg id "${IDS[$i]}" \
       --argjson lat "${LATS[$i]}" \
       --argjson lon "${LONS[$i]}" \
-      '{id:$id, lat:$lat, lon:$lon}')
+      --arg visibility "public" \
+      '{lat:$lat, lon:$lon, visibility:$visibility}')
 
     AUTH_HEADER="Authorization: Bearer ${TOKENS[$i]}"
     RESPONSE=$(curl -s -X POST "$URL" \
