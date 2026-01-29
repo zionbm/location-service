@@ -212,16 +212,25 @@ async function storeLocationRedis(rec: LocationRecord): Promise<void> {
 async function getNearbyRedis(lat: number, lon: number): Promise<LocationRecord[]> {
   if (!redis) return [];
   await redisCleanupStale();
-  const ids = await redis.geosearch(REDIS_GEO_KEY, "FROMLONLAT", lon, lat, "BYRADIUS", NEARBY_RADIUS_M, "m");
+  const rawIds = (await redis.geosearch(
+    REDIS_GEO_KEY,
+    "FROMLONLAT",
+    lon,
+    lat,
+    "BYRADIUS",
+    NEARBY_RADIUS_M,
+    "m"
+  )) as Array<string | Buffer>;
+  const ids = rawIds.map((id) => id.toString());
   if (ids.length === 0) return [];
   const pipeline = redis.pipeline();
   for (const id of ids) {
     pipeline.hgetall(`${REDIS_DATA_PREFIX}${id}`);
   }
-  const results = await pipeline.exec();
+  const results = (await pipeline.exec()) ?? [];
   const records: LocationRecord[] = [];
   results.forEach((res, i) => {
-    const data = res?.[1] as Record<string, string> | undefined;
+    const data = res?.[1] as Record<string, string> | null | undefined;
     if (!data) return;
     const rec: LocationRecord = {
       id: ids[i],
