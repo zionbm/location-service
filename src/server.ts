@@ -358,9 +358,7 @@ app.post("/v1/locations", async (req, reply) => {
                 nearByClients.push({ id: other.id, lat: other.lat, lon: other.lon });
               }
             } else {
-              if (other.visibility === "public" || isFriend) {
-                nearByClients.push({ id: other.id, lat: other.lat, lon: other.lon });
-              }
+              nearByClients.push({ id: other.id, lat: other.lat, lon: other.lon });
             }
           }
         }
@@ -376,9 +374,7 @@ app.post("/v1/locations", async (req, reply) => {
           nearByClients.push({ id: other.id, lat: other.lat, lon: other.lon });
         }
       } else {
-        if (other.visibility === "public" || isFriend) {
-          nearByClients.push({ id: other.id, lat: other.lat, lon: other.lon });
-        }
+        nearByClients.push({ id: other.id, lat: other.lat, lon: other.lon });
       }
     }
   }
