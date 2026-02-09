@@ -55,6 +55,10 @@ const LocationUpdateSchema = z.object({
   visibility: z.enum(["public", "friends"]).optional(),
 });
 
+const ActiveIdsSchema = z.object({
+  ids: z.array(z.string().min(1).max(200)).min(1).max(200),
+});
+
 // -------- Helpers --------
 function cellKey(x: number, y: number): string {
   return `${x}:${y}`;
@@ -383,6 +387,33 @@ app.post("/v1/locations", async (req, reply) => {
     stored: true,
     nearByClients,
   });
+});
+
+/**
+ * POST /v1/locations/active
+ * Body: { ids: [publicId...] }
+ * Response: { activeIds: [publicId...] }
+ */
+app.post("/v1/locations/active", async (req, reply) => {
+  const parsed = ActiveIdsSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return reply.code(400).send({
+      message: "Invalid payload",
+      issues: parsed.error.issues,
+    });
+  }
+
+  const now = Date.now();
+  const activeIds: string[] = [];
+  for (const id of parsed.data.ids) {
+    const rec = await getRecordById(id);
+    if (!rec) continue;
+    if (now - rec.receivedAtMs <= STALE_AFTER_MS) {
+      activeIds.push(id);
+    }
+  }
+
+  return reply.code(200).send({ activeIds });
 });
 
 // Optional debug endpoints
