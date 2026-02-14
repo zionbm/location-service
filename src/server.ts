@@ -266,12 +266,34 @@ app.get("/health", async () => ({ ok: true }));
 
 // Require auth for all routes except /health
 app.addHook("onRequest", async (req, reply) => {
+  (req as any).startMs = Date.now();
   if (req.url === "/health") return;
   try {
     await req.jwtVerify();
+    const friendInfo = await getFriendInfo(req);
+    if (friendInfo) (req as any).userPublicId = friendInfo.publicId;
   } catch {
     return reply.code(401).send({ message: "Unauthorized" });
   }
+});
+
+app.addHook("onResponse", async (req, reply) => {
+  const reqAny = req as any;
+  const publicId = reqAny.userPublicId as string | undefined;
+  if (!publicId) return;
+  const startMs = reqAny.startMs as number | undefined;
+  const durationMs = startMs ? Date.now() - startMs : undefined;
+  req.log.info(
+    {
+      userId: publicId,
+      requestId: req.id,
+      method: req.method,
+      url: req.url,
+      statusCode: reply.statusCode,
+      durationMs,
+    },
+    "request completed"
+  );
 });
 
 /**
@@ -392,6 +414,14 @@ app.post("/v1/locations", async (req, reply) => {
       }
     }
   }
+
+  req.log.info(
+    {
+      userId: id,
+      nearbyCount: nearByClients.length,
+    },
+    "location updated"
+  );
 
   return reply.code(200).send({
     stored: true,
